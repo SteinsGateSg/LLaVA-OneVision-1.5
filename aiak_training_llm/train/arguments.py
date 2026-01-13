@@ -378,7 +378,7 @@ def _add_extra_multimodal_args(parser):
 
     group.add_argument('--trainable-modules', default=['all'], nargs='*',
                        help='choices: all, language_model, adapter, vision_model, '
-                            'language_expert_linear, vision_expert_linear'),
+                            'language_expert_linear, vision_expert_linear, prompt_learner'),
     
     group.add_argument("--dataloader-save", type=str, default=None,
                        help="Energon dataloader state save path")
@@ -415,6 +415,15 @@ def _add_extra_multimodal_args(parser):
 
     group.add_argument('--fps-max-frames', type=int, default=768,
                        help='The maximum number of frames of the video')
+
+    group.add_argument('--prompt-learner-length', type=int, default=0,
+                       help='Number of prompt learner tokens for contrastive pooling. 0 disables.')
+    group.add_argument('--prompt-learner-init-std', type=float, default=0.02,
+                       help='Initialization std for prompt learner embeddings.')
+    group.add_argument('--contrastive-loss-weight', type=float, default=0.0,
+                       help='Weight for image-text contrastive loss. 0 disables.')
+    group.add_argument('--contrastive-temperature', type=float, default=0.07,
+                       help='Temperature for image-text contrastive loss.')
     return parser
 
 

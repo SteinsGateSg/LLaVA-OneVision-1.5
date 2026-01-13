@@ -113,14 +113,18 @@ def rice_vl_model_provider(
         language_rotary_percent=args.rotary_percent,
         language_rotary_base=args.rotary_base,
         seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+        prompt_learner_length=args.prompt_learner_length,
+        prompt_learner_init_std=args.prompt_learner_init_std,
     )
 
     if args.trainable_modules != ['all']:
         train_language_model = "language_model" in args.trainable_modules
         train_vision_model = "vision_model" in args.trainable_modules
         train_adapter = "adapter" in args.trainable_modules
+        train_prompt_learner = "prompt_learner" in args.trainable_modules
         model.freeze(freeze_language_model=not train_language_model,
                     freeze_vision_model=not train_vision_model,
-                    freeze_adapter=not train_adapter)
+                    freeze_adapter=not train_adapter,
+                    freeze_prompt_learner=not train_prompt_learner)
 
     return model

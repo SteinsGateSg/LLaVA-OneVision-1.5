@@ -15,6 +15,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import make_viewless_tensor
 from torch import Tensor
+from torch.nn import functional as F
 
 from aiak_training_llm.models.llavaov_1_5.rice_vision_model import (
     RiceViTModel, VisionModel)
@@ -146,6 +147,8 @@ class LlavaOnevision1_5(MegatronModule):
         fp16_lm_cross_entropy: bool = False,
         share_embeddings_and_output_weights: bool = True,
         seq_len_interpolation_factor: float = None,
+        prompt_learner_length: int = 0,
+        prompt_learner_init_std: float = 0.02,
     ) -> None:
         super().__init__(config=language_config)
 
@@ -158,6 +161,7 @@ class LlavaOnevision1_5(MegatronModule):
         self.vision_model = None
         self.adapter = None
         self.language_model = None
+        self.prompt_learner = None
 
         #  define the vision model and the projection from vision model outputs to language model inputs.
         if self.add_encoder:
@@ -217,6 +221,11 @@ class LlavaOnevision1_5(MegatronModule):
                 self.language_model.share_embeddings_and_output_weights
             )
 
+        if prompt_learner_length > 0:
+            self.prompt_learner = torch.nn.Parameter(
+                torch.randn(prompt_learner_length, language_config.hidden_size) * prompt_learner_init_std
+            )
+
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -246,7 +255,8 @@ class LlavaOnevision1_5(MegatronModule):
         self, 
         freeze_language_model: bool, 
         freeze_vision_model: bool, 
-        freeze_adapter: bool
+        freeze_adapter: bool,
+        freeze_prompt_learner: bool = False,
     ):
         """Freeze model modules.
 
@@ -269,6 +279,46 @@ class LlavaOnevision1_5(MegatronModule):
             for param in module.parameters():
                 param.requires_grad = False
 
+        if freeze_prompt_learner and self.prompt_learner is not None:
+            self.prompt_learner.requires_grad = False
+
+    def _compute_contrastive_loss(
+        self,
+        combined_embeddings: torch.Tensor,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        token_embeddings = combined_embeddings.transpose(0, 1)  # [b, s, h]
+        image_mask = input_ids == self.config.image_token_id
+        text_mask = labels != -100
+        text_mask = text_mask & (input_ids != self.config.image_token_id)
+
+        image_counts = image_mask.sum(dim=1).clamp_min(1).unsqueeze(-1)
+        image_sum = (token_embeddings * image_mask.unsqueeze(-1)).sum(dim=1)
+
+        if self.prompt_learner is not None:
+            prompt_tokens = self.prompt_learner.unsqueeze(0).expand(
+                token_embeddings.size(0), -1, -1
+            )
+            image_sum = image_sum + prompt_tokens.sum(dim=1)
+            image_counts = image_counts + prompt_tokens.size(1)
+
+        image_embeds = image_sum / image_counts
+
+        text_counts = text_mask.sum(dim=1).clamp_min(1).unsqueeze(-1)
+        text_sum = (token_embeddings * text_mask.unsqueeze(-1)).sum(dim=1)
+        text_embeds = text_sum / text_counts
+
+        image_embeds = F.normalize(image_embeds, dim=-1)
+        text_embeds = F.normalize(text_embeds, dim=-1)
+        logits = image_embeds @ text_embeds.T
+        logits = logits / temperature
+        targets = torch.arange(logits.size(0), device=logits.device)
+        loss_i2t = F.cross_entropy(logits, targets)
+        loss_t2i = F.cross_entropy(logits.T, targets)
+        return 0.5 * (loss_i2t + loss_t2i)
+
     def forward(
         self,
         images: torch.Tensor,
@@ -281,7 +331,9 @@ class LlavaOnevision1_5(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         inference_params: InferenceParams = None,
         pixel_values_videos: torch.Tensor = None,
-        video_grid_thw: torch.Tensor = None
+        video_grid_thw: torch.Tensor = None,
+        return_contrastive: bool = False,
+        contrastive_temperature: float = 0.07,
     ) -> torch.Tensor:
         """Forward function of the Qwen-VL model.
 
@@ -414,6 +466,16 @@ class LlavaOnevision1_5(MegatronModule):
 
         # rotary_pos_emb = self.rotary_emb(position_ids).transpose(0, 2).contiguous()
 
+        contrastive_loss = None
+        if return_contrastive:
+            if combined_embeddings is None:
+                raise ValueError("contrastive loss requires pre_process with combined embeddings.")
+            if labels is None:
+                raise ValueError("contrastive loss requires labels for text masking.")
+            contrastive_loss = self._compute_contrastive_loss(
+                combined_embeddings, input_ids, labels, contrastive_temperature
+            )
+
         output = self.language_model(
             input_ids=None,
             position_ids=None,
@@ -427,6 +489,9 @@ class LlavaOnevision1_5(MegatronModule):
             packed_seq_params=packed_seq_params,
             extra_block_kwargs={},
         )
+
+        if return_contrastive:
+            return {"lm_loss": output, "contrastive_loss": contrastive_loss}
 
         return output
 

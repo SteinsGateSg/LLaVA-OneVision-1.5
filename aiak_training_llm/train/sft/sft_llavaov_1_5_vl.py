@@ -113,6 +113,11 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """    
     args = get_args()
 
+    contrastive_loss = None
+    if isinstance(output_tensor, dict):
+        contrastive_loss = output_tensor.get("contrastive_loss")
+        output_tensor = output_tensor["lm_loss"]
+
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
 
@@ -137,6 +142,16 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
     loss_reduced_dict = {'lm loss': (reporting_loss[0], reporting_loss[1])}
+
+    if contrastive_loss is not None and args.contrastive_loss_weight > 0:
+        contrastive_loss = contrastive_loss * args.contrastive_loss_weight
+        if args.context_parallel_size > 1:
+            torch.distributed.all_reduce(contrastive_loss, group=mpu.get_context_parallel_group())
+        contrastive_report = contrastive_loss.clone().detach()
+        torch.distributed.all_reduce(contrastive_report, group=mpu.get_data_parallel_group())
+        contrastive_report = contrastive_report / mpu.get_data_parallel_world_size()
+        loss[0] = loss[0] + contrastive_loss
+        loss_reduced_dict['contrastive loss'] = contrastive_report
 
     if args.variable_seq_lengths:
         # for variable seq length, we need to calculate the number of tokens on fly
@@ -174,7 +189,22 @@ def forward_step(data_iterator, model):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(images, image_grid_thw, input_ids, position_ids, attention_mask, attn_mask_type, labels)
+        if get_args().contrastive_loss_weight > 0:
+            output_tensor = model(
+                images,
+                image_grid_thw,
+                input_ids,
+                position_ids,
+                attention_mask,
+                attn_mask_type,
+                labels,
+                return_contrastive=True,
+                contrastive_temperature=get_args().contrastive_temperature,
+            )
+        else:
+            output_tensor = model(
+                images, image_grid_thw, input_ids, position_ids, attention_mask, attn_mask_type, labels
+            )
  
     return output_tensor, partial(loss_func, loss_mask)
 
